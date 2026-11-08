@@ -3652,6 +3652,261 @@ func TestServerReturnsStreamAndConnFlowControlOnBodyClose(t *testing.T) {
 	})
 }
 
+// serverHandlerCall is a single call to a handler created by newServerHandlerCalls.
+// The handler goroutine blocks until the test asks it to run a function or to exit.
+type serverHandlerCall struct {
+	req   *http.Request
+	fc    chan func(http.ResponseWriter, *http.Request)
+	donec <-chan struct{}
+}
+
+// do runs f on the handler goroutine and waits for it to return.
+func (c *serverHandlerCall) do(f func(http.ResponseWriter, *http.Request)) {
+	ranc := make(chan struct{})
+	select {
+	case c.fc <- func(w http.ResponseWriter, r *http.Request) {
+		defer close(ranc)
+		f(w, r)
+	}:
+	case <-c.donec:
+		return
+	}
+	<-ranc
+}
+
+// exit causes the handler to return.
+func (c *serverHandlerCall) exit() {
+	close(c.fc)
+}
+
+// newServerHandlerCalls returns a handler which sends a *serverHandlerCall
+// on the returned channel for every request it serves, and then runs
+// functions provided by the test until the test tells it to exit.
+// Handlers return early when donec is closed.
+func newServerHandlerCalls(donec <-chan struct{}) (http.HandlerFunc, <-chan *serverHandlerCall) {
+	callc := make(chan *serverHandlerCall)
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		call := &serverHandlerCall{
+			req:   r,
+			fc:    make(chan func(http.ResponseWriter, *http.Request)),
+			donec: donec,
+		}
+		select {
+		case callc <- call:
+		case <-donec:
+			return
+		}
+		for {
+			select {
+			case f, ok := <-call.fc:
+				if !ok {
+					return
+				}
+				f(w, r)
+			case <-donec:
+				return
+			}
+		}
+	}
+	return handler, callc
+}
+
+// nextServerHandlerCall returns the next handler call started by the server.
+func nextServerHandlerCall(t testing.TB, st *serverTester, callc <-chan *serverHandlerCall) *serverHandlerCall {
+	t.Helper()
+	st.sync()
+	select {
+	case call := <-callc:
+		return call
+	default:
+		t.Fatalf("expected a handler call, got none")
+	}
+	return nil
+}
+
+func TestServerResetStreamUnreadBody(t *testing.T) {
+	t.Run("read_after_reset", func(t *testing.T) {
+		donec := make(chan struct{})
+		defer close(donec)
+		handler, callc := newServerHandlerCalls(donec)
+		st := newServerTester(t, handler)
+		defer st.Close()
+
+		st.greet()
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      1,
+			BlockFragment: st.encodeHeader(":method", "POST"),
+			EndHeaders:    true,
+		})
+		call := nextServerHandlerCall(t, st, callc)
+
+		const size = inflowMinRefresh
+		st.writeData(1, false, make([]byte, size))
+		st.writeRSTStream(1, ErrCodeCancel)
+		st.sync()
+
+		// The handler reads the body after the stream has been reset.
+		call.do(func(w http.ResponseWriter, req *http.Request) {
+			io.ReadAll(req.Body)
+		})
+		st.wantWindowUpdate(0, size)
+
+		// Handler exits; no second refund.
+		call.exit()
+		st.wantIdle()
+	})
+
+	t.Run("exit_without_reading", func(t *testing.T) {
+		donec := make(chan struct{})
+		defer close(donec)
+		handler, callc := newServerHandlerCalls(donec)
+		st := newServerTester(t, handler)
+		defer st.Close()
+
+		st.greet()
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      1,
+			BlockFragment: st.encodeHeader(":method", "POST"),
+			EndHeaders:    true,
+		})
+		call := nextServerHandlerCall(t, st, callc)
+
+		const size = inflowMinRefresh
+		st.writeData(1, false, make([]byte, size))
+		st.writeRSTStream(1, ErrCodeCancel)
+		st.sync()
+
+		// The handler exits without reading the body. Flow control is returned on exit.
+		call.exit()
+		st.wantWindowUpdate(0, size)
+		st.wantIdle()
+	})
+
+	t.Run("read_after_handler_exit", func(t *testing.T) {
+		donec := make(chan struct{})
+		defer close(donec)
+		handler, callc := newServerHandlerCalls(donec)
+		st := newServerTester(t, handler)
+		defer st.Close()
+
+		st.greet()
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      1,
+			BlockFragment: st.encodeHeader(":method", "POST"),
+			EndHeaders:    true,
+		})
+		call := nextServerHandlerCall(t, st, callc)
+
+		const size = inflowMinRefresh
+		st.writeData(1, false, make([]byte, size))
+		st.sync()
+
+		// The handler exits without reading the body.
+		call.exit()
+
+		// Flow control is returned when the handler exits.
+		st.wantUnorderedFrames(
+			func(f *WindowUpdateFrame) bool {
+				return f.StreamID == 0 && f.Increment == size
+			},
+			func(f *HeadersFrame) bool {
+				return f.StreamID == 1 && f.StreamEnded()
+			},
+			func(f *RSTStreamFrame) bool {
+				return f.StreamID == 1 && f.ErrCode == ErrCodeNo
+			},
+		)
+
+		// Reading the body after the handler exits must not cause a double refund.
+		io.ReadAll(call.req.Body)
+		st.wantIdle()
+	})
+
+	t.Run("unstarted_handler", func(t *testing.T) {
+		donec := make(chan struct{})
+		defer close(donec)
+		handler, callc := newServerHandlerCalls(donec)
+		st := newServerTester(t, handler, func(s *Server) {
+			s.MaxConcurrentStreams = 1
+		})
+		defer st.Close()
+
+		st.greet()
+
+		// Stream 1 uses the single handler slot.
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      1,
+			BlockFragment: st.encodeHeader(),
+			EndStream:     true,
+			EndHeaders:    true,
+		})
+		call := nextServerHandlerCall(t, st, callc)
+
+		// Reset stream 1 so the client can open another stream without
+		// exceeding the concurrent stream limit.
+		st.writeRSTStream(1, ErrCodeCancel)
+
+		// Stream 3 is queued in unstartedHandlers because the handler for
+		// stream 1 is still executing.
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      3,
+			BlockFragment: st.encodeHeader(":method", "POST"),
+			EndHeaders:    true,
+		})
+
+		const size = inflowMinRefresh
+		st.writeData(3, false, make([]byte, size))
+		st.writeRSTStream(3, ErrCodeCancel)
+		st.wantIdle()
+
+		// Stream 1 handler exits. Stream 3 is removed from unstartedHandlers
+		// and its flow control is returned.
+		call.exit()
+		st.wantWindowUpdate(0, size)
+		st.wantIdle()
+
+		// The handler for stream 3 never runs.
+		st.sync()
+		select {
+		case <-callc:
+			t.Errorf("handler for reset stream 3 unexpectedly started")
+		default:
+		}
+	})
+
+	// Same thing as exit_without_reading, but some imaginary middleware
+	// replaced Request.Body first.
+	t.Run("middleware_replaces_body", func(t *testing.T) {
+		donec := make(chan struct{})
+		defer close(donec)
+		handler, callc := newServerHandlerCalls(donec)
+		st := newServerTester(t, handler)
+		defer st.Close()
+
+		st.greet()
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      1,
+			BlockFragment: st.encodeHeader(":method", "POST"),
+			EndHeaders:    true,
+		})
+		call := nextServerHandlerCall(t, st, callc)
+
+		call.do(func(w http.ResponseWriter, r *http.Request) {
+			// Wrap r.Body like some middleware might.
+			r.Body = http.MaxBytesReader(w, r.Body, 1000)
+		})
+
+		const size = inflowMinRefresh
+		st.writeData(1, false, make([]byte, size))
+		st.writeRSTStream(1, ErrCodeCancel)
+		st.sync()
+
+		call.exit()
+		st.wantWindowUpdate(0, size)
+		st.wantIdle()
+	})
+}
+
 func TestServerIdleTimeout(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping in short mode")
@@ -4112,9 +4367,21 @@ func TestServerWindowUpdateOnBodyClose(t *testing.T) {
 		}
 	}
 
+	st.wantHeaders(wantHeader{
+		streamID:  1,
+		endStream: true,
+	})
+
 	// Writing data after the stream is reset immediately returns flow control credit.
 	st.writeData(1, false, content[windowSize/2:])
-	st.wantWindowUpdate(0, windowSize/2)
+	st.wantUnorderedFrames(
+		func(f *WindowUpdateFrame) bool {
+			return f.StreamID == 0 && f.Increment == windowSize/2
+		},
+		func(f *RSTStreamFrame) bool {
+			return f.StreamID == 1 && f.ErrCode == ErrCodeStreamClosed
+		},
+	)
 
 	if err := <-errc; err != nil {
 		t.Error(err)
